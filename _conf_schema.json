@@ -1,0 +1,12 @@
+{
+    "enable_rich_post": {
+        "description": "是否启用富文本气泡转换（将 Markdown 回复转换为飞书 post 原生富文本元素，替代 md 标签渲染）",
+        "type": "bool",
+        "default": false
+    },
+    "rich_post_title": {
+        "description": "每条富文本消息的标题（留空则不显示标题）",
+        "type": "string",
+        "default": ""
+    }
+}
