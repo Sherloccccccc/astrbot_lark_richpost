@@ -1,4 +1,4 @@
-# astrbot_lark_richpost（飞书富文本气泡插件）
+# astrbot_plugin_lark_richpost（飞书富文本气泡插件）
 
 让 AstrBot 的飞书（Feishu/Lark）回复以更“原生”的富文本气泡呈现：将常见 Markdown（粗体/斜体/删除线/链接/标题、@、图片等）转换为飞书 `post` 消息的**原生富文本元素**（`text` / `a` / `at` / `img`），并可通过配置一键开关。
 
@@ -23,7 +23,7 @@
 
 将本插件目录放到：
 
-`AstrBot/data/plugins/astrbot_lark_richpost/`
+`AstrBot/data/plugins/astrbot_plugin_lark_richpost/`
 
 目录至少应包含：
 
