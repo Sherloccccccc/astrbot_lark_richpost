@@ -1,6 +1,6 @@
 name: astrbot_plugin_lark_richpost
 display_name: 飞书富文本气泡
-desc: 将 AstrBot 在飞书的回复转换为 post 原生富文本气泡（text/a/at/img 等），支持配置开关与标题；不改动 AstrBot 原有代码
+desc: 飞书输出不支持markdown格式渲染，直接输出会导致丢失表格信息，这个插件是为了解决这个问题
 version: v1.0.0
 author: Sherlock
 repo: "https://github.com/Sherloccccccc/astrbot_lark_richpost"
