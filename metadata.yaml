@@ -1,8 +1,8 @@
-name: astrbot_lark_richpost
+name: astrbot_plugin_lark_richpost
 display_name: 飞书富文本气泡
-desc: 将 Markdown 回复转换为飞书 post 原生富文本元素（粗体、斜体、链接、标题等），并支持设置消息标题
+desc: 将 AstrBot 在飞书的回复转换为 post 原生富文本气泡（text/a/at/img 等），支持配置开关与标题；不改动 AstrBot 原有代码
 version: v1.0.0
-author: local
-repo: ""
+author: Sherlock
+repo: "https://github.com/Sherloccccccc/astrbot_lark_richpost"
 support_platforms:
   - lark
