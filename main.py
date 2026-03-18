@@ -9,9 +9,10 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from astrbot.api import logger
 from astrbot.api.star import Context, Star
@@ -22,8 +23,9 @@ if TYPE_CHECKING:
 # --------------------------------------------------------------------------- #
 #  模块级状态（保证跨热重载只 patch 一次，terminate 时能还原）                #
 # --------------------------------------------------------------------------- #
-_original_lark_send = None
-_plugin_config: dict = {}
+_original_lark_send: Callable[..., Coroutine[Any, Any, Any]] | None = None
+_plugin_config_getter: Callable[[], dict] | None = None
+_patch_token = object()
 
 
 # --------------------------------------------------------------------------- #
@@ -94,6 +96,10 @@ def _markdown_to_post_rows(text: str) -> list[list[dict]]:
 #  核心发送逻辑                                                                #
 # --------------------------------------------------------------------------- #
 
+class RichPostSendError(Exception):
+    """包一层，方便调用方区分“富文本发送失败，需要降级”。"""
+
+
 async def _send_rich_post(event_self, message: "MessageChain") -> None:
     """构造并发送飞书原生富文本 post 消息，替代默认的 md 标签方式。
 
@@ -119,6 +125,10 @@ async def _send_rich_post(event_self, message: "MessageChain") -> None:
         elif isinstance(comp, Plain):
             post_rows.extend(_markdown_to_post_rows(comp.text))
         elif isinstance(comp, At):
+            # 在 Lark 适配器中，At.qq 约定为 Feishu open_id，这里直接映射。
+            if not comp.qq:
+                logger.warning("[lark_richpost] At 组件缺少 user_id，已跳过一个 @")
+                continue
             mention = {"tag": "at", "user_id": comp.qq, "style": []}
             if post_rows:
                 post_rows[-1].append(mention)
@@ -127,42 +137,81 @@ async def _send_rich_post(event_self, message: "MessageChain") -> None:
         elif isinstance(comp, AstrBotImage):
             # 图片上传委托给原有静态方法，避免重复实现
             from astrbot.api.event import MessageChain as MC
+
             img_chain = MC()
             img_chain.chain = [comp]
-            img_rows = await LarkMessageEvent._convert_to_lark(img_chain, event_self.bot)
+            img_rows = await LarkMessageEvent._convert_to_lark(
+                img_chain,
+                event_self.bot,
+            )
             post_rows.extend(img_rows)
 
-    title = _plugin_config.get("rich_post_title", "")
+    # 获取配置（若 getter 为空则回退默认）
+    cfg = _plugin_config_getter() if _plugin_config_getter is not None else {}
+    title = cfg.get("rich_post_title", "")
 
-    if post_rows:
-        wrapped = {
-            "zh_cn": {
-                "title": title,
-                "content": post_rows,
+    try:
+        if post_rows:
+            wrapped = {
+                "zh_cn": {
+                    "title": title,
+                    "content": post_rows,
+                }
             }
-        }
-        await LarkMessageEvent._send_im_message(
-            event_self.bot,
-            content=json.dumps(wrapped, ensure_ascii=False),
-            msg_type="post",
-            reply_message_id=event_self.message_obj.message_id,
-        )
+            await LarkMessageEvent._send_im_message(
+                event_self.bot,
+                content=json.dumps(wrapped, ensure_ascii=False),
+                msg_type="post",
+                reply_message_id=event_self.message_obj.message_id,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.error("[lark_richpost] 发送富文本 post 失败: %s", e)
+        raise RichPostSendError from e
+
+    # 附件发送：一条失败不影响其余，可以并发也可以串行
+    tasks: list[Coroutine[Any, Any, Any]] = []
 
     for fc in file_components:
-        await LarkMessageEvent._send_file_message(
-            fc, event_self.bot,
-            reply_message_id=event_self.message_obj.message_id,
-        )
+        async def _send_file(comp: File) -> None:
+            try:
+                await LarkMessageEvent._send_file_message(
+                    comp,
+                    event_self.bot,
+                    reply_message_id=event_self.message_obj.message_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error("[lark_richpost] 发送文件失败: %s", e)
+
+        tasks.append(_send_file(fc))
+
     for ac in audio_components:
-        await LarkMessageEvent._send_audio_message(
-            ac, event_self.bot,
-            reply_message_id=event_self.message_obj.message_id,
-        )
+        async def _send_audio(comp: Record) -> None:
+            try:
+                await LarkMessageEvent._send_audio_message(
+                    comp,
+                    event_self.bot,
+                    reply_message_id=event_self.message_obj.message_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error("[lark_richpost] 发送音频失败: %s", e)
+
+        tasks.append(_send_audio(ac))
+
     for vc in media_components:
-        await LarkMessageEvent._send_media_message(
-            vc, event_self.bot,
-            reply_message_id=event_self.message_obj.message_id,
-        )
+        async def _send_media(comp: Video) -> None:
+            try:
+                await LarkMessageEvent._send_media_message(
+                    comp,
+                    event_self.bot,
+                    reply_message_id=event_self.message_obj.message_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error("[lark_richpost] 发送视频失败: %s", e)
+
+        tasks.append(_send_media(vc))
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -170,32 +219,90 @@ async def _send_rich_post(event_self, message: "MessageChain") -> None:
 # --------------------------------------------------------------------------- #
 
 def _install_patch() -> None:
-    """给 LarkMessageEvent.send 打上富文本补丁（幂等）。"""
+    """给 LarkMessageEvent.send 打上富文本补丁（幂等，带补丁标识）。"""
     global _original_lark_send
 
     try:
         from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
-    except ImportError as e:
-        logger.warning(f"[lark_richpost] 无法导入 LarkMessageEvent，跳过补丁: {e}")
+    except ImportError as e:  # noqa: BLE001
+        logger.warning(
+            "[lark_richpost] 无法导入 LarkMessageEvent，跳过补丁: %s",
+            e,
+        )
         return
 
-    if _original_lark_send is not None:
-        logger.debug("[lark_richpost] 补丁已安装，跳过重复安装")
+    # 如果已经被本插件 patch 过，直接返回
+    current_id = getattr(LarkMessageEvent, "_richpost_patch_id", None)
+    if current_id is _patch_token:
+        logger.debug("[lark_richpost] 富文本补丁已安装，跳过重复安装")
         return
 
-    _original_lark_send = LarkMessageEvent.send
+    # 如果有其他人也 patch 过 send，则只记录日志，不强行覆盖
+    if current_id is not None and current_id is not _patch_token:
+        logger.warning(
+            "[lark_richpost] 检测到其他插件已修改 LarkMessageEvent.send，"
+            "为避免冲突，本插件将跳过安装补丁",
+        )
+        return
 
-    async def patched_send(event_self, message: "MessageChain") -> None:
+    if _original_lark_send is None:
+        _original_lark_send = LarkMessageEvent.send
+
+    async def patched_send(event_self, *args, **kwargs):
+        """兼容未来签名变化的 patched send。
+
+        尝试从第一个位置参数或 message 关键字参数中获取 MessageChain；
+        若无法识别，则直接退回原始实现。
+        """
         from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
-        if not _plugin_config.get("enable_rich_post", False):
-            return await _original_lark_send(event_self, message)
+        message: "MessageChain | None" = None
+        if args:
+            message = args[0]
+        else:
+            maybe_message = kwargs.get("message")
+            message = maybe_message  # type: ignore[assignment]
 
-        await _send_rich_post(event_self, message)
-        # 触发框架级副作用（Metric 上报、_has_send_oper 标记等）
-        await AstrMessageEvent.send(event_self, message)
+        if message is None:
+            logger.debug(
+                "[lark_richpost] 未能从参数中识别出 MessageChain，退回原始 send",
+            )
+            assert _original_lark_send is not None
+            return await _original_lark_send(event_self, *args, **kwargs)
 
-    LarkMessageEvent.send = patched_send
+        cfg = _plugin_config_getter() if _plugin_config_getter is not None else {}
+        enable_rich = cfg.get("enable_rich_post", False)
+
+        try:
+            if enable_rich:
+                try:
+                    await _send_rich_post(event_self, message)
+                except RichPostSendError:
+                    logger.warning(
+                        "[lark_richpost] 富文本发送失败，退回原始 send 流程",
+                    )
+                    assert _original_lark_send is not None
+                    await _original_lark_send(event_self, *args, **kwargs)
+            else:
+                assert _original_lark_send is not None
+                await _original_lark_send(event_self, *args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            logger.error("[lark_richpost] patched_send 发生未预期异常: %s", e)
+            # 最后兜底：确保至少尝试一次原始发送
+            if _original_lark_send is not None:
+                await _original_lark_send(event_self, *args, **kwargs)
+        finally:
+            # 触发框架级副作用（Metric 上报、_has_send_oper 标记等）
+            try:
+                await AstrMessageEvent.send(event_self, message)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    "[lark_richpost] AstrMessageEvent.send 副作用调用失败: %s",
+                    e,
+                )
+
+    LarkMessageEvent._richpost_patch_id = _patch_token  # type: ignore[attr-defined]
+    LarkMessageEvent.send = patched_send  # type: ignore[assignment]
     logger.info("[lark_richpost] 富文本补丁已安装")
 
 
@@ -208,9 +315,13 @@ def _remove_patch() -> None:
 
     try:
         from astrbot.core.platform.sources.lark.lark_event import LarkMessageEvent
-        LarkMessageEvent.send = _original_lark_send
+
+        current_id = getattr(LarkMessageEvent, "_richpost_patch_id", None)
+        if current_id is _patch_token:
+            LarkMessageEvent.send = _original_lark_send  # type: ignore[assignment]
+            delattr(LarkMessageEvent, "_richpost_patch_id")
+            logger.info("[lark_richpost] 富文本补丁已还原")
         _original_lark_send = None
-        logger.info("[lark_richpost] 富文本补丁已还原")
     except ImportError:
         pass
 
@@ -229,14 +340,17 @@ class Main(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context)
         self.config = config or {}
-        # 立即同步到模块级配置引用，使 initialize() 中可见
-        _plugin_config.clear()
-        _plugin_config.update(self.config)
+        # 通过 getter 暴露配置，避免多个实例共享可变 dict 带来的踩踏
+        global _plugin_config_getter
+        _plugin_config_getter = lambda: self.config
 
     async def initialize(self) -> None:
         """插件初始化：安装 monkey-patch。"""
         _install_patch()
-        status = "已启用" if _plugin_config.get("enable_rich_post", False) else "未启用（enable_rich_post=false）"
+        cfg = _plugin_config_getter() if _plugin_config_getter is not None else {}
+        status = (
+            "已启用" if cfg.get("enable_rich_post", False) else "未启用（enable_rich_post=false）"
+        )
         logger.info(f"[lark_richpost] 插件初始化完成，富文本转换：{status}")
 
     async def terminate(self) -> None:

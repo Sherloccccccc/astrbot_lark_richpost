@@ -72,8 +72,8 @@
 
 - **Markdown 表格**：当前不会渲染为表格，会按纯文本显示（例如 `| a | b |` 会原样出现）。  
   说明：表格通常依赖飞书的 `{"tag":"md"}` 渲染能力，而原生元素没有 table 标签。
-- **代码块 / 语法高亮**：不支持（飞书原生元素中无 code block 标签；当前实现会把 `` `inline` `` 当普通文本输出）。
-- **列表/引用/复杂嵌套**：不做结构化解析（目前按“逐行 + 行内样式”处理）。
+- **代码块 / 语法高亮**：不支持（飞书原生元素中无 code block 标签；当前实现会把 `` `inline` `` 当普通文本输出，不做高亮）。
+- **列表/引用/复杂嵌套**：不做结构化解析（目前按“逐行 + 行内样式”处理，不尝试还原 Markdown 块结构）。
 
 如果你希望“表格/代码块也能渲染”，通常需要在检测到这些块时 **回退到 `md` 标签**（混合渲染策略），或改用交互卡片（Card）能力。
 
@@ -86,15 +86,24 @@
 1. 插件 `initialize()` 时安装补丁：将 `astrbot.core.platform.sources.lark.lark_event.LarkMessageEvent.send` 替换为 `patched_send`
 2. 当飞书要发送消息时：
    - 若 `enable_rich_post=false`：直接调用原始 `send`（零影响）
-   - 若 `enable_rich_post=true`：构造飞书 `post` JSON（`zh_cn.title/content`），并调用 AstrBot 已有的 `_send_im_message(...)` 发送
-3. 发送结束后，仍调用 `AstrMessageEvent.send(...)` 保留框架级副作用（如指标上报、发送标记等）
-4. 插件卸载 `terminate()` 时还原补丁，保证不会“污染”后续运行
+   - 若 `enable_rich_post=true`：构造飞书 `post` JSON（`zh_cn.title/content`），并调用 AstrBot 已有的 `_send_im_message(...)` 发送；若发送失败，会记录日志并回退到原始 `send` 路径，确保用户仍能收到文本回复。
+3. 不论哪种路径，最终都会调用一次 `AstrMessageEvent.send(...)` 以保留框架级副作用（如指标上报、发送标记等）。
+4. 插件卸载 `terminate()` 时，会在确认当前 `send` 仍是本插件安装的补丁后才还原，避免误伤其他潜在补丁。
 
 ### 为什么选择 monkey‑patch
 
 - **约束条件**：不改动 AstrBot 本体任何代码，只能“新增”
-- **最小侵入**：补丁点只在 `LarkMessageEvent.send`，且可配置开关、可卸载还原
+- **最小侵入**：补丁点只在 `LarkMessageEvent.send`，且带补丁 ID 标记，可配置开关、可安全卸载
 - **复用框架能力**：图片上传、文件/音频/视频发送、指标上报完全复用 AstrBot 已实现逻辑
+
+---
+
+## 设计考量（工程化细节）
+
+- **补丁安全**：通过 `_richpost_patch_id` 标记补丁归属，仅在 ID 匹配时才卸载，避免与其他插件的潜在 patch 冲突。
+- **签名兼容**：`patched_send` 使用 `*args, **kwargs` 透传参数，只从中解析出 `MessageChain`，降低未来 AstrBot 升级签名时的 break 风险。
+- **配置获取**：通过模块级 `_plugin_config_getter` 间接获取配置，而不是共享可变全局 dict，减少多实例或热重载场景下的踩踏风险。
+- **异常隔离与降级**：富文本发送失败会抛出自定义 `RichPostSendError`，上层捕获后自动回退到原始 `send` 流程，保证用户消息可达；附件发送失败只影响单个附件。
 
 ---
 
@@ -106,6 +115,23 @@
   - 含 `@` 的消息
   - 发送图片与文件附件
   - `enable_rich_post` 开关切换是否影响输出
+
+---
+
+## 测试（pytest）
+
+- 单元测试位于 `tests/test_richpost_core.py`，主要覆盖：
+  - Markdown 行内解析（粗体/斜体/删除线/链接、标题与空行）
+  - `_send_rich_post` 发送主流程与附件调用路径
+  - `patched_send` 在富文本发送失败时的“自动回退原始 send”行为
+- 在已经安装 AstrBot 依赖的环境中，可以在插件目录下直接运行：
+
+```bash
+cd AstrBot/data/plugins/astrbot_plugin_lark_richpost
+pytest -q
+```
+
+如需在全新环境运行这些测试，请先参考 AstrBot 主项目的依赖（`requirements.txt` 或文档），确保核心依赖（如 `sqlalchemy`、`sqlmodel`、`lark-oapi` 等）已安装。
 
 ---
 
